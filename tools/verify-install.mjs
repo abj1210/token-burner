@@ -16,7 +16,7 @@ import { createRequire } from 'node:module'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const PROFILE_DIR = process.argv[2] ?? path.join(os.homedir(), '.dsh', 'profiles', 'desktop')
 const PKG = '@local/token-burner'
@@ -151,6 +151,54 @@ check(!/require\(\s*['"]@deepseek-ai\//.test(clientText), '没有 require 任何
 check(/require\(\s*['"]react['"]\s*\)/.test(clientText), "只 require('react')")
 check(clientText.includes("inject: ['slots']"), "返回 { inject: ['slots'], apply }")
 check(clientText.includes('conversation.composer.dock'), '注册到 conversation.composer.dock 槽位')
+
+console.log('\n[7] 仓库卫生：不得残留真实余额 / 密钥 / 个人路径')
+{
+  // 这个仓库是 public 的。真实账户余额在文档里已脱敏成 <余额A>/<余额B>/<余额C>，
+  // 但第一次脱敏时**只扫了 README，漏掉了 tools/smoke.mjs**（真实余额在公开仓库里躺了一轮）。
+  // 所以现在把它变成一道自动检查 —— 脱敏是「整个仓库」的事，不是「某个文件」的事。
+  const repoDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+  const SKIP_DIRS = new Set(['node_modules', '.git'])
+  const files = []
+  const walk = (d) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      if (SKIP_DIRS.has(e.name)) continue
+      const full = path.join(d, e.name)
+      if (e.isDirectory()) walk(full)
+      else files.push(full)
+    }
+  }
+  walk(repoDir)
+
+  // 真机出现过、且已经脱敏掉的余额读数。任何一个重新出现都算泄漏。
+  const LEAKED_BALANCES = ['63.8472641', '63.75349586', '63.19010394', '61.98504066', '54.16215186']
+  const SECRETS = [/gho_[A-Za-z0-9]{20,}/, /sk-[A-Za-z0-9]{20,}/, /\/Users\/[A-Za-z0-9._-]+\//]
+  const offenders = []
+  for (const f of files) {
+    const rel = path.relative(repoDir, f)
+    // 跳过本文件：它必须**包含**那份真实余额黑名单才能做检查，否则会自己告自己的状。
+    // 其余任何文件都不豁免 —— 泄漏就是泄漏，不分文件。
+    if (rel === 'tools' + path.sep + 'verify-install.mjs') continue
+    let text
+    try {
+      text = fs.readFileSync(f, 'utf8')
+    } catch {
+      continue // 二进制/读不了的文件跳过
+    }
+    for (const v of LEAKED_BALANCES) if (text.includes(v)) offenders.push(`${rel}: 真实余额 ${v}`)
+    for (const re of SECRETS) {
+      const m = re.exec(text)
+      if (m) offenders.push(`${rel}: 敏感串 ${m[0]}`)
+    }
+    // 余额的书写约定是 `CNY <余额X>`；出现 `CNY 数字` 就说明还有个地方没脱敏。
+    const cny = /CNY \d/.exec(text)
+    if (cny) offenders.push(`${rel}: 未脱敏的余额读数（${cny[0]}…）`)
+  }
+  check(
+    offenders.length === 0,
+    `扫了 ${files.length} 个文件，无真实余额/密钥/个人路径${offenders.length ? `\n      ${offenders.join('\n      ')}` : ''}`,
+  )
+}
 
 console.log(failed === 0 ? '\n✅ 安装校验全部通过。\n' : `\n❌ 有 ${failed} 项未通过。\n`)
 process.exit(failed === 0 ? 0 : 1)

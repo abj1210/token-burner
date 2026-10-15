@@ -16,7 +16,7 @@
  */
 
 import fs from 'node:fs'
-import { listRuns, readRun, appendLoadMarker, readLoadMarkers, rootDir, runsDir } from './lib/ledger.js'
+import { listRuns, readRun, appendLoadMarker, readLoadMarkers, rootDir, runsDir, isValidRunId } from './lib/ledger.js'
 import { priceFor, canonicalModel, nextTierChange } from './lib/pricing.js'
 import { Burner, DEFAULTS, resolveConfig, makePlan } from './lib/controller.js'
 
@@ -467,6 +467,11 @@ async function runTool(args = {}, deps = {}) {
         `（连续失败 ${Math.max(cfg.maxConsecutiveFailures, Math.min(cfg.maxConcurrency, 256))} 次**且**这么久没成功才停机；` +
         `失败不计费，所以宽容只花墙钟）`,
     )
+    lines.push(
+      `- 无 usage 限次 \`maxUnaccountedResponses\`：${cfg.maxUnaccountedResponses} 次` +
+        `（成功返回但**没有 usage** 的请求在预算锁眼里是免费的，可它很可能真被计费了；` +
+        `连续这么多次就停机 —— 否则会一直发到 deadline，那段时间的花费全是账外的）`,
+    )
     // 预算锁会压低实际并发 —— 这个数字直接决定墙钟时间，预检里必须点出来。
     const concAtCeiling = Math.max(
       1,
@@ -540,9 +545,15 @@ async function runTool(args = {}, deps = {}) {
         const rec = readRun(r.runId)
         const start = rec.records.find((x) => x.kind === 'start')
         const finish = [...rec.records].reverse().find((x) => x.kind === 'finish')
+        // 旧账本 / 被杀的进程写下的 finish 记录可能缺 result 或 spentCny。
+        // 早期这里直接插值，于是一行行 `实烧 ¥0.095214 (undefined)` 就渲染给了用户。
+        const spent = Number.isFinite(finish?.spentCny) ? `¥${fmt(finish.spentCny)}` : '¥?'
+        const outcome = finish ? `${spent}${finish.result ? ` (${finish.result})` : ''}` : '无结束记录（可能仍在运行或进程被杀）'
+        const reqCount = rec.records.filter((x) => x.kind === 'request').length
         lines.push(
           `- \`${r.runId}\` — ${new Date(r.mtime).toISOString().replace('T', ' ').slice(0, 16)} — ` +
-            `目标 ¥${start?.targetCny ?? '?'} · ${finish ? `实烧 ¥${fmt(finish.spentCny)} (${finish.result})` : '无结束记录（可能仍在运行或进程被杀）'} · ${rec.records.filter((x) => x.kind === 'request').length} 次请求`,
+            `目标 ¥${start?.targetCny ?? '?'} · ${outcome} · ${reqCount} 次请求` +
+            `${rec.invalid ? ' ⚠️ 账本非法或不可读' : ''}`,
         )
       }
     }
@@ -561,8 +572,19 @@ async function runTool(args = {}, deps = {}) {
   }
 
   if (action === 'stop') {
+    // stop() 即使在本轮**已经结束**时也会返回快照，所以不能只看返回值判空 ——
+    // 否则跑完之后再点一次「停机」，会得到「已请求停机、已停止下发新请求」这种
+    // 看起来成功、实际什么都没停的回复（用户会以为自己刚阻止了花钱）。
+    const wasRunning = burner.running
     const s = burner.stop('user-stop')
     if (!s) return { text: '当前没有正在运行的 burn。' }
+    if (!wasRunning) {
+      return {
+        text:
+          `当前没有正在运行的 burn —— 最近一轮 \`${s.runId}\` 已经结束` +
+          `（${s.state}${s.stopReason ? ` · ${s.stopReason}` : ''}），没有需要停的东西。\n\n${renderStatus(s)}`,
+      }
+    }
     return {
       text: `## 已请求停机\n\n已停止下发新请求，在途请求会在宽限期内自然结束（用于拿到准确的 usage），超时后强制中止。\n\n${renderStatus(s)}\n\n_停机不是"撤销"：已经产生的 token 已经被计费。_`,
     }
@@ -574,6 +596,16 @@ async function runTool(args = {}, deps = {}) {
 
   if (action === 'reconcile') {
     const runId = typeof args.runId === 'string' && args.runId.trim() ? args.runId.trim() : null
+    // runId 会被拼进文件路径，所以先净化（见 lib/ledger.js 的 isValidRunId）：
+    // 不查的话 `runId: "../../../../tmp/x"` 能读到 runs 目录外的 *.jsonl。
+    if (runId && !isValidRunId(runId)) {
+      return {
+        text:
+          `对账失败：runId \`${runId}\` 含非法字符或路径片段。\n\n` +
+          `合法的运行 ID 形如 \`burn-20261015-055544-q2h5\` —— 只允许字母、数字、点、下划线、连字符，最长 64 字符，且不含 \`..\`。\n` +
+          `用 \`action: "runs"\` 看有哪些运行。`,
+      }
+    }
     let rec
     try {
       rec = await burner.reconcile(runId)

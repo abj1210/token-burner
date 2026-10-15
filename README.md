@@ -48,9 +48,14 @@
          + maxTokens × 输出单价 × safetyFactor
 ```
 
-每次下发前同步预留，因此 `spent + reserved ≤ target` 恒成立。
+每次下发前同步预留，因此 `spent + reserved ≤ target` 恒成立（预留侧用 `remaining` 封顶，是严格的）。
 代价是可能**欠额** —— 欠额由主循环按剩余金额重算尺寸迭代补齐（几何收敛）。
 容差默认 `max(0.01 元, 目标 × 0.1%)`。
+
+> ⚠️ **唯一已知的超支窗口**：上面的「最坏花费」依赖 `charsPerToken` 估算。若实际字符/token 比低于
+> `charsPerToken × ratioFloor`，**单次请求**最多可能超出预留约 `1/ratioFloor` 倍（默认 1.25×）。
+> 这正是 `safetyFactor`（1.05）与 `ratioFloor`（0.8）存在的原因 —— 超支窗口在**单请求**粒度上，
+> 不是「整轮可以随便超」。详见 [DESIGN.md](DESIGN.md) 的 §1 与 §9。
 
 > 时段提示：高峰时段（北京时间周一至周五 09:00–12:00、14:00–18:00，不含法定节假日）单价 2×。
 > 想**快**就挑高峰期烧（同样金额只需一半 token）；想**多烧 token** 就挑空闲时段。这是两个不同的优化目标。
@@ -78,7 +83,7 @@
 
 ```bash
 node tools/verify-install.mjs            # 校验解析、清单、patch、导出、client 约束
-DSH_HOME=$(mktemp -d) node tools/smoke.mjs   # 26 组断言，全部离线，用假模型
+DSH_HOME=$(mktemp -d) node tools/smoke.mjs   # 54 组断言，全部离线，用假模型
 ```
 
 `verify-install.mjs` 会检查：profile 能否解析到包、`dsh.bundle.patch` 等判据是否齐全、
@@ -170,7 +175,9 @@ tail -1 ~/.dsh/token-burner/plugin-load.jsonl
 或者直接调 `burn_tokens { action: "doctor" }`，看第 5 节的「硬上限 `maxAmountCny`」。
 **改配置也会重跑 `apply()`**，所以留痕行数是判断「有没有生效」的可靠手段。
 
-上限的夹紧范围是 `clamp(x, 0.0001, 1e6)`（`lib/controller.js:114`），即实际可用 ¥0.0001 ~ ¥1,000,000。
+上限的夹紧范围是 `clamp(x, 0.0001, 1e6)`（`lib/controller.js:123`），即实际可用 ¥0.0001 ~ ¥1,000,000。
+不过金额小到「连一次最小请求都买不起」时（默认配置下约 ¥0.00022 以下），预算锁会**一次请求都不发**，
+直接以 `result: "short"` 收尾并给出告警 —— 这是刻意的：宁可明说买不起，也不发无意义的请求。
 
 ---
 
@@ -360,6 +367,26 @@ if (run.failureStreak >= streakLimit && sinceSuccessMs >= config.stallTimeoutMs)
 
 > 不知道为什么要 6 次而不是 2 次的话：`failureStreak` 只在**成功**时清零，
 > 而 `#handleFailure` 每次都设 `cooldownUntil`（最多 8 秒），所以阈值太低会在网络抖动时反复误杀。
+
+### 5. 「成功但没有 usage」必须限次
+
+预算锁全靠 `usage` 记账。一次请求**成功返回却没有 usage** 时，它在预算锁眼里就是**免费的** ——
+但它很可能已经被计费了。更糟的是它会**同时废掉两道闸门**：
+
+- `spentCny` 不增长 → 永远到不了目标；
+- `failureStreak` 每次成功都被清零 → 上面那道「连续失败 + 卡住太久」的闸门永不触发。
+
+于是整轮会一直发请求，直到撞上 `deadlineSeconds` 或 `maxRequests` ——
+而这期间的花费在账本上**完全看不见**。
+
+所以连续 `maxUnaccountedResponses`（默认 5）次「成功但无 usage」就以 `unaccounted` 停机并报错。
+偶发一两次不会误杀：计数器会被下一次**带 usage** 的响应清零。
+provider 正常时恒不触发；这条闸门来自代码审查，而不是来自事故 —— 真机上从未触发过。
+
+对应的停机原因一览（`status.stopReason`）：`undefined`（跑到了目标，正常收尾）、`deadline`（超墙钟）、
+`max-requests`（超请求数）、`user-stop`（用户停机）、`cancelled`（工具调用被取消）、
+`plugin-unload`（插件卸载）、`stalled`（provider 停止服务）、`unaccounted`（记账已不可信）、
+`quota-exhausted`（余额耗尽）、`stuck`（预算锁与请求尺寸逻辑不一致，属插件 bug）。
 
 ---
 

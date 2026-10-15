@@ -5,6 +5,15 @@
   "type": "module",
   "description": "按指定金额（人民币元）快速消耗 token 的 DSH 插件：真实调用模型、真实扣费，带预算锁、余额对账与审计日志。默认硬上限 1 元。",
   "license": "MIT",
+  "author": "abj1210",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/abj1210/token-burner.git"
+  },
+  "homepage": "https://github.com/abj1210/token-burner#readme",
+  "bugs": {
+    "url": "https://github.com/abj1210/token-burner/issues"
+  },
   "main": "index.js",
   "keywords": [
     "dsh",

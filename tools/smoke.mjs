@@ -14,7 +14,7 @@
 import assert from 'node:assert/strict'
 import { Burner, resolveConfig, makePlan } from '../lib/controller.js'
 import { priceFor, isPeak, beijingDateKey, beijingParts, nextTierChange } from '../lib/pricing.js'
-import { readStats, listRuns, readRun, appendRecord } from '../lib/ledger.js'
+import { readStats, listRuns, readRun, appendRecord, isValidRunId } from '../lib/ledger.js'
 
 const TRUE_CHARS_PER_TOKEN = Number(process.env.TRUE_RATIO ?? 5) // 真值故意不同于初值 4
 const LATENCY_MS = 3
@@ -402,6 +402,223 @@ async function main() {
     )
   }
 
+  console.log('\n[3e] 预算锁与请求尺寸必须同源（「预留得下、发不出去」会微任务空转并饿死定时器）')
+  {
+    // ⚠️ 这个用例**必须**在子进程里跑，而且是这套测试里唯一这样的用例。
+    //    出 bug 时主事件循环被微任务占满：setTimeout 永远不触发，同进程的任何
+    //    watchdog 都救不回来（真机复现过：整轮挂死、CPU 打满，只能 SIGKILL）。
+    //    如果在进程内 await，整个测试套件会一起挂住 —— 所以只能用 spawnSync 的
+    //    timeout，因为那是**父进程**在计时，而父进程是健康的。
+    const { spawnSync } = await import('node:child_process')
+    const { writeFileSync, mkdtempSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { join, dirname } = await import('node:path')
+    const { fileURLToPath, pathToFileURL } = await import('node:url')
+
+    const controllerUrl = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '..', 'lib', 'controller.js')).href
+    const childPath = join(mkdtempSync(join(tmpdir(), 'burner-spin-')), 'child.mjs')
+    writeFileSync(
+      childPath,
+      `
+import { Burner, resolveConfig } from ${JSON.stringify(controllerUrl)}
+
+const targetCny = Number(process.argv[2])
+const overrides = JSON.parse(process.argv[3])
+// 'dead' = 每次 stream 都抛错（用于验证「一次请求都不该发」）；
+// 'live' = 正常回 usage + finish（用于验证末尾残余额度也能收敛）。
+const mode = process.argv[4]
+
+let streamCalls = 0
+const llm = {
+  listProviders: () => [],
+  async resolveModelInfo(provider, model) {
+    return {
+      provider, id: model, name: model,
+      context: { contextWindow: 1000000 },
+      defaultMaxTokens: 256000,
+      reasoning: { efforts: [{ id: 'off', name: 'off', default: true }], default: 'off' },
+    }
+  },
+  async *stream(req) {
+    streamCalls += 1
+    if (mode === 'dead') throw new Error('不该被调用')
+    const chars = req.messages[0].content[0].text.length
+    const inputTokens = Math.round(chars / 5)
+    yield { type: 'usage', usage: { inputTokens, outputTokens: 8, cacheReadTokens: 0, cacheWriteTokens: 0 } }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  },
+}
+
+const burner = new Burner({ llm, account: null })
+const config = resolveConfig({ requestCostCny: 0.01, maxConcurrency: 4, maxInputTokens: 20000, ...overrides }, targetCny)
+burner.start({ targetCny, model: 'deepseek-flash', provider: 'fake', config })
+
+const t0 = Date.now()
+// 这一行依赖定时器：主循环一旦被微任务占满，这里就永远不会退出。
+while (burner.running && Date.now() - t0 < 8000) await new Promise((r) => setTimeout(r, 10))
+
+const s = burner.status()
+console.log(JSON.stringify({
+  stillRunning: burner.running, streamCalls, ms: Date.now() - t0,
+  spentCny: s.spentCny, reservedCny: s.reservedCny, inflight: s.concurrency.inflight,
+  result: s.result, state: s.state, stopReason: s.stopReason,
+}))
+// 必须显式退出：即使 run 结束了，挂着的 cooldown 定时器也会把进程留在事件循环里。
+process.exit(0)
+`,
+      'utf8',
+    )
+
+    const cases = [
+      // 金额本身就落在死锁带里：预算锁应当直接拒发，一次 LLM 调用都不该有。
+      { name: '金额本身落在死锁带内', target: 0.00021, overrides: {}, mode: 'dead', zeroRequests: true },
+      // 这条最危险：金额完全正常，只是单请求预算取了个小值。而 requestCostCny 是工具参数
+      // （index.js 会从 args 合并进来），README 还写着「越小越精细」，用户很容易踩到。
+      {
+        name: '金额 ¥1 正常、但单请求预算低于最小尺寸',
+        target: 1, overrides: { requestCostCny: 0.00021 }, mode: 'dead', zeroRequests: true,
+      },
+      // 末尾残余额度落进带内：会先正常发过请求，然后残余买不起最小请求 → 必须收敛。
+      // 容差要调小，否则默认的 max(0.01, …) 会在开跑前就把整个目标吃掉（见 [9b]）。
+      {
+        name: '运行末尾残余额度落进带内',
+        target: 0.0005, overrides: { requestCostCny: 0.2, toleranceCny: 0.00002 }, mode: 'live', zeroRequests: false,
+      },
+    ]
+    for (const c of cases) {
+      const r = spawnSync(process.execPath, [childPath, String(c.target), JSON.stringify(c.overrides), c.mode], {
+        timeout: 25000,
+        encoding: 'utf8',
+        env: process.env,
+      })
+      const detail = `（signal=${r.signal} status=${r.status} stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}）`
+      assert.notEqual(r.signal, 'SIGTERM', `${c.name}：子进程被超时杀掉 —— 又出现了微任务空转${detail}`)
+      assert.equal(r.status, 0, `${c.name}：子进程退出码非 0${detail}`)
+      const out = JSON.parse(r.stdout.trim().split('\n').pop())
+      assert.equal(out.stillRunning, false, `${c.name}：必须自己收敛，不能一直在跑`)
+      assert.equal(out.reservedCny, 0, `${c.name}：预算锁必须归零，不能泄漏（否则剩余额度被永久吃掉）`)
+      assert.equal(out.inflight, 0, `${c.name}：在途计数必须归零`)
+      assert.ok(
+        out.spentCny + out.reservedCny <= c.target + 1e-12,
+        `${c.name}：不得超支（spent=${out.spentCny} reserved=${out.reservedCny} target=${c.target}）`,
+      )
+      if (c.zeroRequests) {
+        assert.equal(out.streamCalls, 0, `${c.name}：买不起最小请求时**一次 LLM 调用都不该发**`)
+        assert.equal(out.spentCny, 0, `${c.name}：不应花钱`)
+      } else {
+        assert.ok(out.streamCalls > 0, `${c.name}：构造场景无效，一次请求都没发出去`)
+      }
+      console.log(`      · ${c.name} → ${out.state}/${out.result}（${out.ms}ms，请求 ${out.streamCalls} 次，¥${out.spentCny}）`)
+    }
+    ok('额度落在「预留得下、发不出去」的带里时立即收敛：零空转、零泄漏、不超支')
+  }
+
+  console.log('\n[3f] 成功但没有 usage 必须限次；RATE_LIMIT / QUOTA / 上下文超限三条分支')
+  {
+    // 「成功但没 usage」的形态：finish 正常、就是没有 usage chunk。
+    // 单独看一次无害，但它同时废掉两道闸门 —— spentCny 不涨（到不了目标）、
+    // failureStreak 被清零（停机闸门不触发）—— 于是会一直发到 deadline，花费全在账外。
+    function silentLlm({ usageEvery = 0 } = {}) {
+      let calls = 0
+      return {
+        listProviders: () => [{ id: 'fake', name: 'Fake' }],
+        stream(options) {
+          calls += 1
+          const withUsage = usageEvery > 0 && calls % usageEvery === 0
+          return (async function* gen() {
+            if (withUsage) {
+              const text = options.messages?.[0]?.content?.[0]?.text ?? ''
+              const inputTokens = Math.max(1, Math.round(text.length / TRUE_CHARS_PER_TOKEN))
+              const usage = { inputTokens, outputTokens: 2, cacheReadTokens: 0, cacheWriteTokens: 0 }
+              usage.totalTokens = inputTokens + 2
+              yield { type: 'usage', usage }
+            }
+            yield { type: 'finish', reason: { kind: 'stop' } }
+          })()
+        },
+      }
+    }
+
+    // 固定错误码的假 provider。failFirst 次失败后转成功。
+    function codeLlm(code, { failFirst = Infinity, retryAfterMs = 0 } = {}) {
+      let calls = 0
+      return {
+        listProviders: () => [{ id: 'fake', name: 'Fake' }],
+        stream(options) {
+          calls += 1
+          if (calls > failFirst) {
+            const text = options.messages?.[0]?.content?.[0]?.text ?? ''
+            const inputTokens = Math.max(1, Math.round(text.length / TRUE_CHARS_PER_TOKEN))
+            const usage = { inputTokens, outputTokens: 2, cacheReadTokens: 0, cacheWriteTokens: 0 }
+            usage.totalTokens = inputTokens + 2
+            return (async function* gen() {
+              yield { type: 'usage', usage }
+              yield { type: 'finish', reason: { kind: 'stop' } }
+            })()
+          }
+          const failure = { code, message: `injected ${code}` }
+          if (retryAfterMs) failure.providerRetryAfterMs = retryAfterMs
+          return (async function* gen() {
+            yield { type: 'finish', reason: { kind: 'error', failure } }
+          })()
+        },
+      }
+    }
+
+    async function drive(llm, overrides, targetCny) {
+      const burner = new Burner({ llm, account: null })
+      const config = resolveConfig(
+        { requestCostCny: 0.01, maxInputTokens: 8000, maxConcurrency: 2, ...overrides },
+        targetCny,
+      )
+      burner.start({ targetCny, model: 'deepseek-flash', provider: 'fake', config })
+      const until = Date.now() + 20000
+      while (burner.running && Date.now() < until) await new Promise((r) => setTimeout(r, 20))
+      // 断言失败时别把还在跑的实例留在后台（会拖住事件循环、污染后续用例）。
+      if (burner.running) burner.stop('test-cleanup')
+      return { status: burner.status(), config }
+    }
+
+    // A. 全程无 usage → 自己停下来，并说清原因。靠闸门，不靠 deadline。
+    const a = await drive(silentLlm(), { maxUnaccountedResponses: 3 }, 1)
+    assert.equal(a.status.stopReason, 'unaccounted', `全无 usage 应以 unaccounted 停机，实际 ${a.status.stopReason}`)
+    assert.equal(a.status.state, 'error', '这不是正常收尾，state 应为 error')
+    assert.ok(
+      a.status.warnings.some((w) => w.includes('没有 usage')),
+      `警告必须点明「没有 usage」：${JSON.stringify(a.status.warnings)}`,
+    )
+    assert.equal(a.status.spentCny, 0, '没有 usage 就不该记出花费')
+    assert.ok(a.status.requests.ok >= 3, `应确实发够几次才停，实际 ok=${a.status.requests.ok}`)
+
+    // B. 每 2 次里有 1 次带 usage → 计数被清零，不该误杀（阈值 2）。
+    const b = await drive(silentLlm({ usageEvery: 2 }), { maxUnaccountedResponses: 2, maxRequests: 8 }, 1)
+    assert.notEqual(b.status.stopReason, 'unaccounted', '偶发缺 usage 不该触发停机闸门')
+
+    // C. RATE_LIMIT → 计数 + 并发减半 + 退避，然后还能继续跑到目标（不是致命错误）。
+    const c = await drive(codeLlm('RATE_LIMIT', { failFirst: 2, retryAfterMs: 1 }), { toleranceCny: 0.005 }, 0.05)
+    assert.equal(c.status.requests.rateLimited, 2, `限流计数应为 2，实际 ${c.status.requests.rateLimited}`)
+    assert.ok(c.status.warnings.some((w) => w.includes('触发限流')), '应给出限流告警')
+    assert.equal(
+      c.status.concurrency.limit,
+      1,
+      `限流应把并发从 2 减半到 1（上限不低于 minConcurrency），实际 ${c.status.concurrency.limit}`,
+    )
+    assert.equal(c.status.result, 'target-reached', `限流不该是致命错误，实际 ${c.status.result}/${c.status.stopReason}`)
+
+    // D. QUOTA → 立刻以 quota-exhausted 收尾（余额耗尽，重试没有意义）。
+    const d = await drive(codeLlm('QUOTA'), { maxConsecutiveFailures: 3 }, 0.05)
+    assert.equal(d.status.stopReason, 'quota-exhausted', `QUOTA 应立即停机，实际 ${d.status.stopReason}`)
+    assert.equal(d.status.state, 'error', 'QUOTA 停机后 state 应为 error')
+
+    // E. CONTEXT_WINDOW_EXCEEDED → 单请求输入上限降到 75%，而不是整轮失败。
+    const e = await drive(codeLlm('CONTEXT_WINDOW_EXCEEDED', { failFirst: 2 }), { toleranceCny: 0.005 }, 0.05)
+    assert.equal(e.config.maxInputTokens, 4500, `8000 → 6000 → 4500，实际 ${e.config.maxInputTokens}`)
+    assert.ok(e.status.warnings.some((w) => w.includes('超出上下文')), '应给出上下文超限告警')
+    assert.equal(e.status.result, 'target-reached', `上下文超限应自动缩容后继续，实际 ${e.status.result}/${e.status.stopReason}`)
+
+    ok('无 usage 限次停机；RATE_LIMIT 退避、QUOTA 立刻停、上下文超限缩容 —— 四条分支都被执行')
+  }
+
   console.log('\n[4] 预算锁 + 收敛（目标 ¥0.05，容差 ¥0.01）')
   {
     const { s, llm } = await burn({ targetCny: 0.05 })
@@ -592,9 +809,10 @@ async function main() {
 
   console.log('\n[8c] 余额括号结算延迟：差额 0 必须标记为不可信，而不是被读成「没花钱」')
   {
-    // 真机实测：跑完 9 秒后复读余额，before 与 after 一模一样（63.19010394 → 63.19010394），
+    // 真机实测过的形状：跑完 9 秒后复读余额，before 与 after 一模一样，
     // 但账本记了 ¥0.0952。旧代码只会把 driftCny 算成负值，不给任何提示。
-    const frozen = { status: 'ready', value: [{ currency: 'CNY', balance: '63.19010394' }], bonusWallets: [] }
+    // 数值是虚构的（真实读数不写进公开仓库，见 README 的脱敏说明）。
+    const frozen = { status: 'ready', value: [{ currency: 'CNY', balance: '100.5' }], bonusWallets: [] }
     const acct = { async getBalance() { return frozen } }
     const { s } = await burn({ targetCny: 0.05, account: acct })
     assert.ok(s.spentCny > 0, '假 LLM 必须真的花了钱，否则这个用例没意义')
@@ -671,8 +889,8 @@ async function main() {
     appendRecord(legacyId, {
       kind: 'finish', at: new Date().toISOString(), spentCny: 0.095214,
       balance: {
-        before: { currency: 'CNY', total: 63.19010394, at: new Date(Date.now() - 60000).toISOString() },
-        after: { currency: 'CNY', total: 63.19010394 },
+        before: { currency: 'CNY', total: 100.5, at: new Date(Date.now() - 60000).toISOString() },
+        after: { currency: 'CNY', total: 100.5 },
         deltaCny: 0,                    // ← 结算延迟造成的假 0
       },
     })
@@ -685,6 +903,74 @@ async function main() {
     assert.ok(legacyText.includes('反推'), '应说明这个判断是反推的')
     assert.ok(!legacyText.includes('NaN'), '反推分支同样不能出现 NaN')
     ok('旧账本缺 settled 字段时按括号反推，不会把假 0 当成「没花钱」')
+  }
+
+  console.log('\n[8e] runId 必须净化（它来自工具参数，会被直接拼进文件路径）')
+  {
+    // 合法形状是插件自己生成的 burn-<时间戳>-<4 位随机>。
+    assert.equal(isValidRunId('burn-20261015-055544-q2h5'), true, '合法 runId 必须放行')
+    for (const bad of ['../../../../tmp/evil', '..', 'a/b', 'a\\b', '', 'x'.repeat(65), null, 42, {}]) {
+      assert.equal(isValidRunId(bad), false, `必须拒绝 ${JSON.stringify(bad)}`)
+    }
+    // 真正的威胁：路径穿越读到 runs 目录之外的 *.jsonl。
+    const escaped = readRun('../../../../tmp/evil')
+    assert.equal(escaped.records.length, 0, '路径穿越必须读不到任何东西')
+    assert.equal(escaped.invalid, true, '非法 runId 应被显式标记为 invalid')
+
+    // 工具层：非法 runId 要拿到**明确原因**，而不是静默变成「没有这个运行」。
+    const { runTool } = await import('../index.js')
+    const { burner, config } = await burn({ targetCny: 0.03, overrides: { toleranceCny: 0.005 } })
+    const sel = { provider: 'fake', model: 'deepseek-flash' }
+    const badText = (await runTool({ action: 'reconcile', runId: '../../../../tmp/evil' }, { burner, config, defaultSelection: sel })).text
+    assert.ok(badText.includes('非法字符'), `非法 runId 必须被工具层拦住并说明原因：${badText}`)
+    assert.ok(!badText.includes('undefined'), '错误信息里不能出现 undefined')
+    ok('runId 净化：路径穿越被拒，且工具层给出明确原因')
+  }
+
+  console.log('\n[8f] status / stop / runs 三条渲染分支（此前从未被任何测试执行过）')
+  {
+    const { runTool } = await import('../index.js')
+    const sel = { provider: 'fake', model: 'deepseek-flash' }
+    const tiny = { requestCostCny: 0.01, maxInputTokens: 20000, toleranceCny: 0.01 }
+    const { burner, config } = await burn({ targetCny: 0.05, overrides: tiny })
+    // 渲染里出现 undefined/NaN/[object Object] 是最典型的「没人看过这个分支」症状。
+    const clean = (t, who) => assert.ok(!/undefined|NaN|\[object Object\]/.test(t), `${who} 渲染不得出现 undefined/NaN：${t}`)
+
+    const st = (await runTool({ action: 'status' }, { burner, config, defaultSelection: sel })).text
+    assert.ok(st.includes('¥'), 'status 必须给出金额')
+    clean(st, 'status')
+
+    // 空闲时 stop：必须说清「没有需要停的东西」，而不是假装停掉了什么。
+    // （stop() 在运行结束后仍会返回快照，早期实现因此会回一句「已请求停机」。）
+    const spIdle = (await runTool({ action: 'stop' }, { burner, config, defaultSelection: sel })).text
+    assert.ok(spIdle.includes('没有正在运行的 burn'), `空闲时 stop 应说明没有在跑，实际：${spIdle.slice(0, 90)}`)
+    assert.ok(!spIdle.includes('已请求停机'), '空闲时 stop 不得谎称「已请求停机」')
+    clean(spIdle, 'stop(idle)')
+
+    // 在跑时 stop：要报出停机请求 + 当时的快照 + 「停机不是撤销」的提醒。
+    const live = new Burner({ llm: makeFakeLlm(), account: null })
+    const liveCfg = resolveConfig(
+      // DEFAULTS.maxAmountCny 保持 1（不配置时的安全兜底）；故意跑一个 ¥5 的大目标好让它停不下来。
+      { requestCostCny: 0.01, maxInputTokens: 20000, maxConcurrency: 2, maxAmountCny: 50 },
+      5,
+    )
+    live.start({ targetCny: 5, model: 'deepseek-flash', provider: 'fake', config: liveCfg })
+    await new Promise((r) => setTimeout(r, 150))
+    const spLive = (await runTool({ action: 'stop' }, { burner: live, config: liveCfg, defaultSelection: sel })).text
+    assert.ok(spLive.includes('已请求停机'), `在跑时 stop 应报出停机，实际：${spLive.slice(0, 100)}`)
+    assert.ok(spLive.includes('停机不是'), 'stop 应提醒「停机不是撤销」')
+    clean(spLive, 'stop')
+    const until = Date.now() + 15000
+    while (live.running && Date.now() < until) await new Promise((r) => setTimeout(r, 20))
+    if (live.running) live.stop('test-cleanup')
+
+    const rn = (await runTool({ action: 'runs' }, { burner, config, defaultSelection: sel })).text
+    assert.ok(rn.includes('最近的 burn 运行'), 'runs 应有标题')
+    assert.ok(rn.includes(burner.status().runId), `runs 应列出刚跑完的这一轮（${burner.status().runId}）`)
+    assert.ok(rn.includes('每次请求一行记录'), 'runs 应说明审计日志的用途')
+    clean(rn, 'runs')
+
+    ok('status / stop（空闲 + 在跑）/ runs 三条分支都能渲染，且不出现 undefined')
   }
 
   console.log('\n[9] 审计日志')
@@ -893,6 +1179,10 @@ async function main() {
     assert.ok(doc.text.includes('未发起任何模型调用'))
     assert.ok(doc.text.includes('ctx.llm'), 'doctor 必须报告 llm 服务状态')
     assert.ok(doc.text.includes('✅ 可用'), 'doctor 应报告服务可用')
+    // doctor 第 5 节必须把「停机闸门」类参数摊开 —— 它们决定钱花得对不对。
+    for (const key of ['stallTimeoutMs', 'maxUnaccountedResponses', 'maxConsecutiveFailures', 'requestTimeoutMs']) {
+      assert.ok(doc.text.includes(key), `doctor 必须报告 ${key}（否则用户看不到它本轮的实际值）`)
+    }
     // 惰性解析的核心回归断言：加载期缺席、运行期必须可见
     assert.ok(
       doc.text.includes('deepseekAccount') && !doc.text.includes('运行期仍不可见'),

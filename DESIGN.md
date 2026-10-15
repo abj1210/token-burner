@@ -309,7 +309,7 @@ while (target - spent > tol) {
 | [token-burner/lib/ledger.js](lib/ledger.js) | JSONL 审计日志 + 跨运行经验常数 |
 | [token-burner/lib/controller.js](lib/controller.js) | 预算锁、并发工作池、AIMD、单请求超时、停机时间闸门、记账、余额对账 |
 | [token-burner/client.js](client.js) | Web 面板（`conversation.composer.dock`，五个按钮） |
-| [token-burner/tools/smoke.mjs](tools/smoke.mjs) | 本地冒烟测试：假 LLM，**不联网不花钱**，50 组断言 |
+| [token-burner/tools/smoke.mjs](tools/smoke.mjs) | 本地冒烟测试：假 LLM，**不联网不花钱**，54 组断言 |
 | [token-burner/tools/verify-install.mjs](tools/verify-install.mjs) | 只读校验：profile 解析、插件判据、patch 结构、导出、client 约束 |
 | [token-burner/README.md](README.md) | 用法 + 风险提示与免责声明 + 真机运行实录 |
 
