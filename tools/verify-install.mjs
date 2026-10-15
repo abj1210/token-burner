@@ -170,14 +170,19 @@ console.log('\n[7] 仓库卫生：不得残留真实余额 / 密钥 / 个人路�
   }
   walk(repoDir)
 
-  // 真机出现过、且已经脱敏掉的余额读数。任何一个重新出现都算泄漏。
-  const LEAKED_BALANCES = ['63.8472641', '63.75349586', '63.19010394', '61.98504066', '54.16215186']
-  const SECRETS = [/gho_[A-Za-z0-9]{20,}/, /sk-[A-Za-z0-9]{20,}/, /\/Users\/[A-Za-z0-9._-]+\//]
+  // ⚠️ 这里**故意不写**真实余额的字面量。第一版 checker 把 5 个真实读数当黑名单抄了进来 ——
+  //    结果 checker 自己成了仓库里最后的泄漏点（公开仓库的读者照样能看到那串数字）。
+  //    改用两条**形状**规则，它们抓的是同一批东西，却不需要知道原值：
+  //      ① 余额的书写约定是 `CNY <余额X>`：出现 `CNY 数字` 就是没脱敏干净；
+  //      ② 真机余额一律有 ≥7 位小数，而仓库里合法的长小数只有「差额」，差额的书写约定是 `¥…`。
+  //         所以「≥7 位小数、且前面不是 ¥」就是泄漏。
+  const SECRETS = [/gho_[A-Za-z0-9]{20,}/, /sk-[A-Za-z0-9]{20,}/, /[/]Users[/][A-Za-z0-9._-]+[/]/]
+  const BARE_LONG_DECIMAL = /(?<!¥)\b\d+\.\d{7,}\b/g
   const offenders = []
   for (const f of files) {
     const rel = path.relative(repoDir, f)
-    // 跳过本文件：它必须**包含**那份真实余额黑名单才能做检查，否则会自己告自己的状。
-    // 其余任何文件都不豁免 —— 泄漏就是泄漏，不分文件。
+    // 跳过本文件：下面 SECRETS 里的正则**源码**本身含有 `/Users/` 这样的字面片段，
+    // 不跳过就会自己告自己的状。其余任何文件都不豁免 —— 泄漏就是泄漏，不分文件。
     if (rel === 'tools' + path.sep + 'verify-install.mjs') continue
     let text
     try {
@@ -185,14 +190,20 @@ console.log('\n[7] 仓库卫生：不得残留真实余额 / 密钥 / 个人路�
     } catch {
       continue // 二进制/读不了的文件跳过
     }
-    for (const v of LEAKED_BALANCES) if (text.includes(v)) offenders.push(`${rel}: 真实余额 ${v}`)
     for (const re of SECRETS) {
       const m = re.exec(text)
       if (m) offenders.push(`${rel}: 敏感串 ${m[0]}`)
     }
-    // 余额的书写约定是 `CNY <余额X>`；出现 `CNY 数字` 就说明还有个地方没脱敏。
-    const cny = /CNY \d/.exec(text)
-    if (cny) offenders.push(`${rel}: 未脱敏的余额读数（${cny[0]}…）`)
+    text.split('\n').forEach((line, i) => {
+      const at = `${rel}:${i + 1}`
+      const cny = /CNY \d/.exec(line)
+      if (cny) offenders.push(`${at}: 未脱敏的余额读数（${cny[0]}…）`)
+      // 明确的「差额」上下文（README 里引用的审计账本片段）里，长小数是合法的。
+      if (/deltaCny|driftCny|rawDeltaCny/.test(line)) return
+      for (const m of line.matchAll(BARE_LONG_DECIMAL)) {
+        offenders.push(`${at}: 疑似未脱敏的余额读数（${m[0]}；长小数要写成 ¥… 的差额）`)
+      }
+    })
   }
   check(
     offenders.length === 0,
