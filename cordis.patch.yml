@@ -1,0 +1,66 @@
+# token-burner 插件在 profile 中的挂载行。
+#
+# ⚠️⚠️ 这个插件会真实花钱 ⚠️⚠️
+#   maxAmountCny 是**硬上限**：任何一次 burn 的目标金额超过它就会被直接拒绝。
+#   默认 1 元是故意设得很低的。确认你清楚后果之后再往上调。
+#
+#   maxConcurrency 会同时向 DeepSeek 发这么多并发请求，请从保守值开始。
+#   requestCostCny 是单次请求的预算，越小越精细、请求数越多。
+#
+#   holidays 填中国法定节假日（'YYYY-MM-DD'，北京时间）。
+#   留空时，工作日的节假日会被当成高峰价 —— 这是保守方向（只会欠额后迭代补齐，不会超支）。
+- insert:
+    - id: token-burner
+      name: '@local/token-burner'
+      config:
+        # ⚠️ 单次运行最多能花多少钱（元）。想烧更多必须改这一行。
+        # 出厂值是 1 元（刻意的防误操作设计，见 README 免责声明第 2 条）。
+        # 改这个文件**必须重启应用**才生效 —— dsh-hmr 只监听 profile 的
+        # cordis.patch.yml 与 home 的 cordis.patch.yml，不监听 bundle 自带的 patch。
+        # 不想重启的话，走 README「改配置」一节里的 B 路径（profile 覆盖层，热生效）。
+        maxAmountCny: 1
+        # 单次请求预算（元）。它同时是**单次请求的预留额度**和预算锁的粒度。
+        # ⚠️ 2026-10-15 真机结论：**这个值比 maxConcurrency 重要得多**。
+        #   provider 的限流形态是「握住连接不回复」而不是 429（整轮 rateLimited 恒为 0），
+        #   而且它**每波只肯服务 3 个左右的请求**，其余全部挂到超时 —— 无论我们并发多少。
+        #   所以「提高并发 = 更快」是错的，唯一有效的杠杆是**把单请求做大**：
+        #     requestCostCny 0.05 → 每次约 19k token（¥0.038）→ ¥5 约需 147 次成功，实测 30 分钟只跑到 ¥0.305
+        #     requestCostCny 0.2  → 每次约 76k token（¥0.152）→ ¥5 约需  33 次成功，实测 30 分钟跑到 ¥4.850
+        requestCostCny: 0.2
+        # 单次请求最多填多少输入 token
+        maxInputTokens: 200000
+        # 并发请求数。官方并发限制：flash 2500 / v4-pro 500。
+        # ⚠️ 别指望靠它提速：2026-10-15 实测并发 64 的效果比并发 8 **更差** ——
+        #   64 个请求里只有 3 个成功，其余 61 个全部挂满 120 秒超时才回收槽位。
+        #   8 已足够喂饱「每波 3 个」的服务节奏，且失败时浪费的墙钟最少。
+        maxConcurrency: 8
+        # input = 烧「输入·缓存未命中」（默认，快 ~100 倍）；output = 烧输出（准，很慢）
+        lane: input
+        # 烧输入时的推理强度：'off' | 'low' | 'high' | 'max'
+        reasoningEffort: off
+        # 每轮运行的墙钟上限（秒），0 = 不限。
+        # 建议给一个上界：真机上 ¥5 目标跑满 30 分钟只到 97%，deadline 是唯一能兜住它的东西。
+        deadlineSeconds: 1800
+        # 单请求超时（毫秒），0 = 不限。必须留着：provider 卡死时在途请求会一直占住预算锁。
+        # 触发时失败码记为 TIMEOUT 并退避重试；超时的请求拿不到 usage，所以不记账。
+        # 请求越大要填越久（76k token ≈ 13 秒），别设得比正常耗时还紧。
+        requestTimeoutMs: 60000
+        # 停机判据的**时间闸门**（毫秒）：连续失败 N 次 **且** 距上次成功已超过这么久，才停机。
+        # 请求是成波下发的，provider 一个「坏时刻」会同时打掉整波在途请求 ——
+        # 只看连续失败计数会把「一个坏时刻」读成「连续 N 次失败」。
+        # 真机证据：2026-10-15 一轮 ¥5 运行因此被误杀，15 秒只推进了 ¥0.085。
+        # 失败不计费，所以宽容的代价只有墙钟时间。
+        stallTimeoutMs: 45000
+        # 是否写审计日志到 ~/.dsh/token-burner/runs/*.jsonl
+        journal: true
+        # 中国法定节假日（'YYYY-MM-DD'）；留空 = 保守（工作日的节假日按高峰价算）
+        holidays: []
+        # ─── 客户端身份（余额对账用，平时不用改）─────────────────────────
+        # getBalance(client) 必须收到 { version, locale, timezoneOffsetSeconds }，
+        # 它们会变成 x-client-version / x-client-locale / x-client-timezone-offset 三个头。
+        # 平时由 UI 经 RPC 传入；Host 侧插件只能自己合成，缺失会报
+        #   "Cannot read properties of undefined (reading 'version')"。
+        # 三项留空时自动取：应用版本（Info.plist） / zh-CN / 本机时区（UTC 以东为正秒数）。
+        # clientVersion: '0.2.0-rc.2'
+        # clientLocale: zh-CN
+        # timezoneOffsetSeconds: 28800
